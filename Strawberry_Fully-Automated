@@ -1,0 +1,192 @@
+import sys
+import cv2
+import numpy as np
+import pyrealsense2 as rs
+from ultralytics import YOLO
+from quanser.hardware import HIL
+from array import array
+import time
+
+# ==========================================================
+# 0. CONFIGURATION & CALIBRATION
+# ==========================================================
+sys.path.append(r'C:\Program Files\Quanser\Quanser SDK\python')
+MODEL_SEG_PATH = r'C:\Users\Rohit\Desktop\Robotics_Project\fruit_sorting_final\weights\best.pt'
+
+GRIP_X = 500 
+GRIP_Y = 425 
+
+# Sequence: 3 (Vision) + 8 (Reduce) + 10 (Plunge) = 21 Total
+MAX_STEPS = 21           
+CONF_THRESHOLD = 0.55   
+KP_BASE, KP_ELBOW = 0.0006, 0.0009
+STEP_DELAY = 1.0         
+REDUCE_DELAY = 2.0       
+
+CHANNELS = array('I', [1000, 1001, 1002, 1003, 1004]) 
+ZONE_START = [2.1400, 0.2200, 0.6400, 0.0, 0.0]
+ZONE_WAYPOINT_2 = [-0.0053, 0.0852, -0.1035, 0.0, 0.0]
+ZONE_PLACE = [-1.4510, 0.5677, 0.6713, 0.0, 0.0]
+
+# ==========================================================
+# 1. MISSION CONTROL VISION (Y-AXIS HUD REFERENCE)
+# ==========================================================
+def get_spider_vision(mask):
+    y, x = np.where(mask > 0)
+    if len(x) < 20: return 0.0, (0, 0), []
+    pts = np.column_stack((x, y)).astype(np.float32)
+    mean, eigenvectors, _ = cv2.PCACompute2(pts, np.mean(pts, axis=0).reshape(1, -1))
+    cx, cy = int(mean[0][0]), int(mean[0][1])
+    
+    # HUD visual only: angle relative to Y-axis
+    vx, vy = eigenvectors[0, 0], eigenvectors[0, 1]
+    y_ref_angle = np.arctan2(vx, -vy) 
+    
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    web_pts = []
+    if contours:
+        cnt = max(contours, key=cv2.contourArea)
+        web_pts = cnt[::max(1, len(cnt)//10)]
+    return y_ref_angle, (cx, cy), web_pts
+
+def draw_hud(img, mask, theta_y, center, web, step, mode="SCANNING", status="ACTIVE"):
+    h, w, _ = img.shape
+    cv2.drawMarker(img, (GRIP_X, GRIP_Y), (255, 0, 255), cv2.MARKER_CROSS, 20, 1)
+
+    if center[0] != 0:
+        cx, cy = center
+        if mask is not None:
+            overlay = img.copy()
+            overlay[mask > 128] = [0, 255, 0]
+            cv2.addWeighted(overlay, 0.4, img, 0.6, 0, img)
+        
+        # 1. White Quadrants
+        cv2.line(img, (0, cy), (w, cy), (255, 255, 255), 1)
+        cv2.line(img, (cx, 0), (cx, h), (255, 255, 255), 1)
+        
+        # 2. Red Spider Web
+        for p in web:
+            cv2.line(img, (cx, cy), (int(p[0][0]), int(p[0][1])), (0, 0, 255), 1)
+        
+        # 3. Y-Axis Reference Line (Blue Vertical)
+        cv2.line(img, (cx, cy), (cx, cy - 60), (255, 50, 0), 2)
+        
+        # 4. Angle Arc
+        deg_y = np.degrees(theta_y)
+        cv2.ellipse(img, (cx, cy), (30, 30), -90, 0, int(deg_y), (255, 50, 0), 2)
+        
+        color = (255, 255, 255) if status == "ACTIVE" else (0, 255, 255)
+        cv2.circle(img, (cx, cy), 5, (0, 0, 255), -1)
+        cv2.putText(img, f"[{status}] deg_y:{deg_y:.1f}", (cx + 10, cy + 25), 0, 0.5, color, 1)
+
+    cv2.putText(img, f"STEP: {step}/{MAX_STEPS} | NO ROTATION: {mode}", (20, 50), 1, 1.5, (255, 255, 255), 3)
+    return img
+
+# ==========================================================
+# 2. ALIGNMENT LOGIC (3 Vision -> 8 Slow Reduce -> 10 Plunge)
+# ==========================================================
+def run_precision_alignment(card, pipeline, align_obj, model):
+    step, lost_cnt = 0, 0
+    frozen_cx, frozen_cy, frozen_web = 0, 0, []
+    stored_theta_y = 0.0
+
+    while step < MAX_STEPS:
+        card.write_digital(np.array([0], dtype=np.uint32), 1, np.array([1], dtype=np.uint8))
+        f = pipeline.poll_for_frames()
+        if not f: continue
+        img = np.asanyarray(align_obj.process(f).get_color_frame().get_data())
+        state = array('d', [0.0]*5); card.read_other(CHANNELS, 5, state); q = list(state)
+        
+        # 🛠️ WRIST ROTATION FORCED TO NEUTRAL
+        q[3] = 0.0 
+
+        # PHASE 1: Vision (3 Steps)
+        if step < 3:
+            current_delay = STEP_DELAY
+            res = model.predict(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), conf=0.45, verbose=False)
+            if res[0].masks is not None and len(res[0].masks.data) > 0:
+                lost_cnt = 0
+                mask = (res[0].masks.data[0].cpu().numpy()*255).astype(np.uint8)
+                theta_y, (cx, cy), web = get_spider_vision(mask)
+                frozen_cx, frozen_cy, frozen_web = cx, cy, web
+                stored_theta_y = theta_y
+                
+                ex, ey = GRIP_X - cx, GRIP_Y - cy
+                q[0] += ex * KP_BASE; q[2] -= ey * KP_ELBOW
+                cv2.imshow("Mission Control", draw_hud(img, mask, theta_y, (cx, cy), web, step, "VISION", "ACTIVE"))
+            else:
+                lost_cnt += 1
+                if lost_cnt >= 3: return False 
+
+        # PHASE 2: Slow Reduction (8 Steps)
+        elif step < 11:
+            current_delay = REDUCE_DELAY 
+            q[2] += 10.0 * KP_ELBOW 
+            cv2.imshow("Mission Control", draw_hud(img, None, stored_theta_y, (frozen_cx, frozen_cy), frozen_web, step, "REDUCTION", "LOCKED"))
+
+        # PHASE 3: Final Plunge (10 Steps)
+        else:
+            current_delay = STEP_DELAY
+            q[2] -= 45.0 * KP_ELBOW 
+            cv2.imshow("Mission Control", draw_hud(img, None, stored_theta_y, (frozen_cx, frozen_cy), frozen_web, step, "PLUNGE", "LOCKED"))
+
+        card.write_other(CHANNELS, 5, array('d', q))
+        step += 1
+        if cv2.waitKey(1) & 0xFF == ord('q'): return False
+        time.sleep(current_delay)
+    return True
+
+# ==========================================================
+# 3. MISSION EXECUTION
+# ==========================================================
+def travel(card, pipeline, align_obj, target, dur, mode, current_grip=None):
+    start_t = time.time(); state = array('d', [0.0]*5); card.read_other(CHANNELS, 5, state); s_j = list(state)
+    while (time.time() - start_t) < dur:
+        t = (time.time() - start_t) / dur
+        interp = [s_j[i] + (target[i]-s_j[i])*(t**2*(3-2*t)) for i in range(5)]
+        if current_grip is not None: interp[4] = current_grip
+        card.write_digital(np.array([0], dtype=np.uint32), 1, np.array([1], dtype=np.uint8))
+        card.write_other(CHANNELS, 5, array('d', interp))
+        f = pipeline.poll_for_frames()
+        if f:
+            img = np.asanyarray(f.get_color_frame().get_data())
+            cv2.imshow("Mission Control", draw_hud(img, None, 0, (0,0), [], 0, mode))
+        cv2.waitKey(1)
+
+model = YOLO(MODEL_SEG_PATH)
+pipeline = rs.pipeline(); align_obj = rs.align(rs.stream.color); pipeline.start()
+card = HIL(); card.open("qarm_usb", "0")
+
+try:
+    while True:
+        travel(card, pipeline, align_obj, ZONE_START, 5.0, "RESET", current_grip=0.0)
+        pose_scan = [1.5400, 0.2400, 0.8600, 0.0, 0.0]
+        travel(card, pipeline, align_obj, pose_scan, 6.0, "SCANNING", current_grip=0.0)
+        
+        scan_t = time.time(); locked_on = False
+        while (time.time() - scan_t) < 5.0:
+            f = pipeline.poll_for_frames()
+            if f:
+                img = np.asanyarray(f.get_color_frame().get_data())
+                res = model.predict(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), conf=CONF_THRESHOLD, verbose=False)
+                if res[0].masks is not None and len(res[0].masks.data) > 0:
+                    if run_precision_alignment(card, pipeline, align_obj, model):
+                        locked_on = True; break
+                    else: break
+                cv2.imshow("Mission Control", img)
+            cv2.waitKey(1)
+
+        if locked_on: 
+            state = array('d', [0.0]*5); card.read_other(CHANNELS, 5, state); q_curr = list(state)
+            target_force, grip_steps = 0.85, 12
+            for s in range(grip_steps + 1):
+                q_curr[4] = (target_force / grip_steps) * s
+                card.write_other(CHANNELS, 5, array('d', q_curr)); time.sleep(0.1) 
+            time.sleep(1.0) 
+            travel(card, pipeline, align_obj, ZONE_WAYPOINT_2, 12.0, "TRANSIT", current_grip=0.85)
+            travel(card, pipeline, align_obj, ZONE_PLACE, 15.0, "DROP-OFF", current_grip=0.85)
+            release_pose = list(ZONE_PLACE); release_pose[4] = 0.0 
+            card.write_other(CHANNELS, 5, array('d', release_pose)); time.sleep(2.0)
+
+finally:
+    card.close(); pipeline.stop(); cv2.destroyAllWindows()
