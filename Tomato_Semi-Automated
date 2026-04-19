@@ -1,1 +1,150 @@
+import sys
+import os
+import cv2
+import numpy as np
+import pyrealsense2 as rs
+from ultralytics import YOLO
+from quanser.hardware import HIL
+from array import array
+import time
 
+# ==========================================================
+# 0. SAFETY TIMING & HARDWARE PATHS
+# ==========================================================
+# University of Birmingham Robotics Lab SDK Path
+sys.path.append(r'C:\Program Files\Quanser\Quanser SDK\python')
+
+# SLOW-MOTION SCALE: Protects hardware from momentum-based motor trips
+TRANSIT_TIME  = 10.0 
+APPROACH_TIME = 8.0  
+GRIP_TIME     = 5.0  
+
+# ==========================================================
+# 1. FINAL CALIBRATED WAYPOINTS (Radians)
+# ==========================================================
+# [Base, Shoulder, Elbow, Wrist]
+
+REST_POSE  = [-0.0163, -0.8000,  1.5978,  0.0000]
+HOME_POSE  = [ 0.0783, -0.0575,  0.1895,  0.0000]
+SCAN_POSE  = [ 1.6383,  0.4525,  0.2795,  0.0000] 
+HOVER_POSE = [ 1.6383,  0.5500,  0.3000,  0.0000] 
+PICK_POSE  = [ 1.6383,  0.6925,  0.3695,  0.0000] 
+DROP_POSE  = [-1.5417,  0.4525,  0.2795,  0.0000]
+
+G_OPEN     = 0.050
+G_CLOSE    = 0.640 # UPDATED FORCE PARAMETER
+
+READ_CHANNELS  = array('I', [1000, 1001, 1002, 1003, 1004])
+WRITE_CHANNELS = array('I', [1000, 1001, 1002, 1003, 1004])
+
+# ==========================================================
+# 2. VISION-INTEGRATED MOVEMENT ENGINE
+# ==========================================================
+def move_with_live_feed(card, target, grip, duration, pipeline, model):
+    """Interpolates moves while maintaining the CV2 HUD feed for monitoring."""
+    start_time = time.time()
+    current_state = array('d', [0.0] * 5)
+    try:
+        card.read_other(READ_CHANNELS, 5, current_state)
+    except: return False
+    start_j = list(current_state[:4])
+    
+    while (time.time() - start_time) < duration:
+        t = (time.time() - start_time) / duration
+        # Cubic Easing: Smooths acceleration curves
+        t_eased = t * t * (3 - 2 * t) 
+        interp = [start_j[i] + (target[i] - start_j[i]) * t_eased for i in range(4)]
+        
+        try:
+            card.write_other(WRITE_CHANNELS, 5, array('d', interp + [float(grip)]))
+            
+            # --- LIVE FEED UPDATE ---
+            frames = pipeline.poll_for_frames()
+            if frames:
+                color_frame = frames.get_color_frame()
+                if color_frame:
+                    img = np.asanyarray(color_frame.get_data())
+                    # YOLO overlay for HUD only (logic is direct-path)
+                    results = model.predict(img, conf=0.5, verbose=False)
+                    for r in results:
+                        for box in r.boxes:
+                            x1, y1, x2, y2 = map(int, box.xyxy[0])
+                            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    
+                    cv2.imshow("Q-Arm Harvester - Force Calibration (0.850)", img)
+                    cv2.waitKey(1)
+        except: return False
+        time.sleep(0.01)
+    
+    card.write_other(WRITE_CHANNELS, 5, array('d', list(target) + [float(grip)]))
+    return True
+
+# ==========================================================
+# 3. INITIALIZATION
+# ==========================================================
+print(f"🚀 Launching Safe-Guard v3.9 (Force: {G_CLOSE})...")
+model = YOLO('All_Material_For_Detection/fruit_bt.pt')
+
+pipeline = rs.pipeline()
+config = rs.config()
+config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+pipeline.start(config)
+
+card = HIL()
+try:
+    card.open("qarm_usb", "0")
+    # Disengage Brakes (DO 0: 1 = Release)
+    card.write_digital(np.array([0], dtype=np.uint32), 1, np.array([1], dtype=np.uint8))
+    print("🔓 Hardware Armed. Executing Path Sequence.")
+except Exception as e: print(f"❌ Connection Error: {e}"); sys.exit()
+
+# ==========================================================
+# 4. DIRECT EXECUTION SEQUENCE
+# ==========================================================
+try:
+    # 1. INITIALIZE TRANSIT
+    print("📍 Phase 1: Moving to Rest...")
+    move_with_live_feed(card, REST_POSE, G_OPEN, 5.0, pipeline, model)
+    
+    print("🏠 Phase 2: Moving to Home...")
+    move_with_live_feed(card, HOME_POSE, G_OPEN, TRANSIT_TIME, pipeline, model)
+    
+    # 2. THE PATH TO TARGET
+    print("📡 Phase 3: Moving to Scan Position...")
+    move_with_live_feed(card, SCAN_POSE, G_OPEN, TRANSIT_TIME, pipeline, model)
+    
+    print("🚁 Phase 4: Transition to Hover...")
+    move_with_live_feed(card, HOVER_POSE, G_OPEN, APPROACH_TIME, pipeline, model)
+    
+    print("🦾 Phase 5: Executing Pick Descent...")
+    if move_with_live_feed(card, PICK_POSE, G_OPEN, APPROACH_TIME, pipeline, model):
+        print(f"✊ Actuating Gripper (Force Level: {G_CLOSE})...")
+        # Multi-command loop for hardware signal reliability
+        for _ in range(25):
+            card.write_other(WRITE_CHANNELS, 5, array('d', list(PICK_POSE) + [float(G_CLOSE)]))
+            time.sleep(0.05)
+        time.sleep(1.5)
+
+        # 3. RETRACT & PLACE
+        print("⬆️ Phase 6: Vertical Extraction...")
+        move_with_live_feed(card, HOVER_POSE, G_CLOSE, APPROACH_TIME, pipeline, model)
+        
+        print("🏠 Phase 7: Safe Return via Home...")
+        move_with_live_feed(card, HOME_POSE, G_CLOSE, TRANSIT_TIME, pipeline, model)
+
+        print("🚚 Phase 8: Delivering to Drop Zone...")
+        move_with_live_feed(card, DROP_POSE, G_CLOSE, TRANSIT_TIME, pipeline, model)
+        move_with_live_feed(card, DROP_POSE, G_OPEN, GRIP_TIME, pipeline, model)
+
+    # 4. RESET
+    print("✅ Mission Success. Returning to Final Rest.")
+    move_with_live_feed(card, HOME_POSE, G_OPEN, TRANSIT_TIME, pipeline, model)
+    move_with_live_feed(card, REST_POSE, G_OPEN, APPROACH_TIME, pipeline, model)
+
+finally:
+    # Safe Exit: Re-engage Brakes
+    card.write_digital(np.array([0]), 1, np.array([0], dtype=np.uint8))
+    card.close()
+    pipeline.stop()
+    cv2.destroyAllWindows()
+    print("🔌 System Safely Reset.")
