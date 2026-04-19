@@ -1,0 +1,198 @@
+import sys
+import cv2
+import numpy as np
+import pyrealsense2 as rs
+from ultralytics import YOLO
+from quanser.hardware import HIL
+from array import array
+import time
+
+# ==========================================================
+# 0. CONFIGURATION & CALIBRATION
+# ==========================================================
+sys.path.append(r'C:\Program Files\Quanser\Quanser SDK\python')
+MODEL_SEG_PATH = r'C:\Users\Rohit\Desktop\Robotics_Project\fruit_sorting_final\weights\best.pt'
+
+GRIP_X = 450 
+GRIP_Y = 320 
+
+MAX_STEPS = 33           # 25 (Vision) + 7 (Blind)
+CONF_THRESHOLD = 0.55   
+KP_BASE, KP_ELBOW = 0.0006, 0.0009
+STEP_DELAY = 1.0         
+
+CHANNELS = array('I', [1000, 1001, 1002, 1003, 1004]) 
+ZONE_START = [2.1400, 0.2200, 0.6400, 0.0, 0.0]
+
+# Transit Waypoints
+ZONE_WAYPOINT_1 = [1.6947, 0.0852, -0.1035, 0.0852, 0.0]
+ZONE_WAYPOINT_2 = [-0.0053, 0.0852, -0.1035, 0.0852, 0.0]
+ZONE_WAYPOINT_3 = [-1.5640, -0.0537, 0.0136, 0.0023, 0.0]
+ZONE_PLACE = [-1.4510, 0.5677, 0.6713, 0.0852, 0.0]
+
+PATROL_SEQUENCE = [
+    ([1.4899, 0.2200, 0.6400, 0.0, 0.0], "ZONE 2"), 
+    ([1.5400, 0.2400, 0.8600, 0.0, 0.0], "ZONE 4"), 
+    ([2.1640, 0.2400, 0.8600, 0.0, 0.0], "ZONE 3")
+]
+
+# ==========================================================
+# 1. MISSION CONTROL VISION ENGINE
+# ==========================================================
+def get_spider_vision(mask):
+    y, x = np.where(mask > 0)
+    if len(x) < 30: return 0.0, 0.0, (0, 0), []
+    pts = np.column_stack((x, y)).astype(np.float32)
+    mean, eigenvectors, _ = cv2.PCACompute2(pts, np.mean(pts, axis=0).reshape(1, -1))
+    cx, cy = int(mean[0][0]), int(mean[0][1])
+    maj_angle = np.arctan2(eigenvectors[0,1], eigenvectors[0,0])
+    brd_angle = maj_angle + (np.pi / 2.0)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    web_pts = []
+    if contours:
+        cnt = max(contours, key=cv2.contourArea)
+        web_pts = cnt[::max(1, len(cnt)//10)]
+    return maj_angle, brd_angle, (cx, cy), web_pts
+
+def draw_hud(img, mask, maj, brd, center, web, step, mode="SCANNING"):
+    h, w, _ = img.shape
+    cv2.drawMarker(img, (GRIP_X, GRIP_Y), (255, 0, 255), cv2.MARKER_CROSS, 20, 1)
+
+    if mask is not None:
+        cx, cy = center
+        overlay = img.copy()
+        overlay[mask > 128] = [0, 255, 0]
+        cv2.addWeighted(overlay, 0.4, img, 0.6, 0, img)
+        
+        cv2.line(img, (0, cy), (w, cy), (255, 255, 255), 1)
+        cv2.line(img, (cx, 0), (cx, h), (255, 255, 255), 1)
+        
+        for p in web:
+            cv2.line(img, (cx, cy), (int(p[0][0]), int(p[0][1])), (0, 0, 255), 1)
+            
+        len_ax = 80
+        cv2.line(img, (cx, cy), (int(cx + len_ax * np.cos(maj)), int(cy + len_ax * np.sin(maj))), (255, 255, 0), 3) 
+        cv2.line(img, (cx, cy), (int(cx - len_ax * np.cos(maj)), int(cy - len_ax * np.sin(maj))), (255, 255, 0), 3)
+        cv2.line(img, (cx, cy), (int(cx + (len_ax-20) * np.cos(brd)), int(cy + (len_ax-20) * np.sin(brd))), (0, 255, 255), 3) 
+        
+        cv2.line(img, (cx, cy), (cx + 60, cy), (0, 0, 255), 2) 
+        cv2.ellipse(img, (cx, cy), (30, 30), 0, 0, np.degrees(maj), (0, 0, 255), 2)
+        cv2.putText(img, "th", (cx + 35, cy - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        cv2.putText(img, "Q1", (cx + 15, cy - 15), 0, 0.5, (255,255,255), 1)
+        cv2.putText(img, "Q2", (cx - 35, cy - 15), 0, 0.5, (255,255,255), 1)
+        cv2.putText(img, "Q3", (cx - 35, cy + 25), 0, 0.5, (255,255,255), 1)
+        cv2.putText(img, "Q4", (cx + 15, cy + 25), 0, 0.5, (255,255,255), 1)
+        cv2.circle(img, (cx, cy), 5, (0, 0, 255), -1)
+
+    status_text = f"STEP: {step}/{MAX_STEPS} | {mode}"
+    cv2.putText(img, status_text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 3)
+    return img
+
+# ==========================================================
+# 2. ALIGNMENT & MISSION LOGIC
+# ==========================================================
+def run_precision_alignment(card, pipeline, align_obj, model):
+    step, lost_cnt, stored_q3 = 0, 0, 0.0
+    while step < MAX_STEPS:
+        card.write_digital(np.array([0], dtype=np.uint32), 1, np.array([1], dtype=np.uint8))
+        f = pipeline.poll_for_frames()
+        if not f: continue
+        img = np.asanyarray(align_obj.process(f).get_color_frame().get_data())
+        state = array('d', [0.0]*5); card.read_other(CHANNELS, 5, state); q = list(state)
+
+        if step < 25:
+            res = model.predict(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), conf=0.35, verbose=False)
+            if res[0].masks is not None and len(res[0].masks.data) > 0:
+                lost_cnt = 0
+                mask = (res[0].masks.data[0].cpu().numpy()*255).astype(np.uint8)
+                ma, br, (cx, cy), web = get_spider_vision(mask)
+                if step == 24:
+                    vx, vy = np.cos(br), np.sin(br)
+                    angle_x = np.arctan2(abs(vy), abs(vx))
+                    stored_q3 = -angle_x if (vx * vy) < 0 else angle_x
+                
+                ex, ey = GRIP_X - cx, GRIP_Y - cy
+                q[0] += ex * KP_BASE; q[2] -= ey * KP_ELBOW
+                cv2.imshow("Q-Arm Mission Control", draw_hud(img, mask, ma, br, (cx, cy), web, step, "CENTERING"))
+            else:
+                lost_cnt += 1
+                if lost_cnt >= 3: return False
+        else:
+            q[2] -= 30.0 * KP_ELBOW; q[3] = stored_q3
+            cv2.imshow("Q-Arm Mission Control", draw_hud(img, None, 0, 0, (0,0), [], step, "DESCENT"))
+
+        card.write_other(CHANNELS, 5, array('d', q))
+        step += 1
+        if cv2.waitKey(1) & 0xFF == ord('q'): return False
+        time.sleep(STEP_DELAY)
+    return True
+
+def travel(card, pipeline, align_obj, target, dur, mode, current_grip=None):
+    start_t = time.time(); state = array('d', [0.0]*5); card.read_other(CHANNELS, 5, state); s_j = list(state)
+    while (time.time() - start_t) < dur:
+        t = (time.time() - start_t) / dur
+        interp = [s_j[i] + (target[i]-s_j[i])*(t**2*(3-2*t)) for i in range(5)]
+        if current_grip is not None: interp[4] = current_grip
+        card.write_other(CHANNELS, 5, array('d', interp))
+        f = pipeline.poll_for_frames()
+        if f:
+            img = np.asanyarray(f.get_color_frame().get_data())
+            cv2.imshow("Q-Arm Mission Control", draw_hud(img, None, 0,0,(0,0),[],0, mode))
+        cv2.waitKey(1)
+
+# Start System
+model = YOLO(MODEL_SEG_PATH)
+pipeline = rs.pipeline(); align_obj = rs.align(rs.stream.color); pipeline.start()
+card = HIL(); card.open("qarm_usb", "0")
+
+try:
+    while True:
+        # Standard speed for Reset
+        travel(card, pipeline, align_obj, ZONE_START, 5.0, "RESET", current_grip=0.0)
+        
+        locked_on = False
+        for pose, name in PATROL_SEQUENCE:
+            if locked_on: break
+            travel(card, pipeline, align_obj, pose, 6.0, f"SCANNING {name}", current_grip=0.0)
+            
+            scan_t = time.time()
+            while (time.time() - scan_t) < 4.0:
+                f = pipeline.poll_for_frames()
+                if f:
+                    img = np.asanyarray(f.get_color_frame().get_data())
+                    res = model.predict(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), conf=CONF_THRESHOLD, verbose=False)
+                    if res[0].masks is not None and len(res[0].masks.data) > 0:
+                        if run_precision_alignment(card, pipeline, align_obj, model):
+                            locked_on = True; break
+                        else: break
+                    cv2.imshow("Q-Arm Mission Control", img)
+                if cv2.waitKey(1) & 0xFF == ord('q'): sys.exit()
+        
+        if locked_on: 
+            # 1. PICK (Slow Grip)
+            print("✊ GRIPPING SLOWLY (Target: 0.75)...")
+            state = array('d', [0.0]*5); card.read_other(CHANNELS, 5, state); q_curr = list(state)
+            
+            target_force = 0.85
+            grip_steps = 5
+            for s in range(grip_steps + 1):
+                q_curr[4] = (target_force / grip_steps) * s
+                card.write_other(CHANNELS, 5, array('d', q_curr))
+                time.sleep(0.1) # Total grip time: ~2.0 seconds
+            
+            time.sleep(1.0) 
+
+            # 2. TRANSIT - EXTRA SLOW (Durations increased to 12.0s)
+            travel(card, pipeline, align_obj, ZONE_WAYPOINT_1, 12.0, "TRANSIT 1 (EXTRA SLOW)", current_grip=0.85)
+            travel(card, pipeline, align_obj, ZONE_WAYPOINT_2, 12.0, "TRANSIT 2 (EXTRA SLOW)", current_grip=0.85)
+            travel(card, pipeline, align_obj, ZONE_WAYPOINT_3, 12.0, "TRANSIT 3 (EXTRA SLOW)", current_grip=0.85)
+
+            # 3. PLACE - EXTRA SLOW (Duration increased to 15.0s)
+            travel(card, pipeline, align_obj, ZONE_PLACE, 15.0, "DROP-OFF (EXTRA SLOW)", current_grip=0.85)
+            
+            release_pose = list(ZONE_PLACE); release_pose[4] = 0.0 
+            card.write_other(CHANNELS, 5, array('d', release_pose)); time.sleep(2.0)
+
+finally:
+    card.close(); pipeline.stop(); cv2.destroyAllWindows()
