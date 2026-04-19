@@ -1,0 +1,129 @@
+import sys
+import cv2
+import numpy as np
+import pyrealsense2 as rs
+from ultralytics import YOLO
+from quanser.hardware import HIL
+from array import array
+import time
+
+# ==========================================================
+# 0. CONFIGURATION & CALIBRATION
+# ==========================================================
+sys.path.append(r'C:\Program Files\Quanser\Quanser SDK\python')
+MODEL_SEG_PATH = r'C:\Users\Rohit\Desktop\Robotics_Project\fruit_sorting_final\weights\best.pt'
+
+# 🛠️ YOUR CALIBRATED PARAMETERS
+GRIP_X, GRIP_Y = 500, 320 
+CHANNELS = array('I', [1000, 1001, 1002, 1003, 1004])
+
+# Movement Sensitivity
+MOVE_STEP = 0.02
+GRIP_STEP = 0.05  # 🐌 Slow gripper increment
+
+# Initial Pose
+curr_q = [2.14, 0.22, 0.64, 0.0, 0.0]
+
+# ==========================================================
+# 1. VISION ENGINE (Spider HUD)
+# ==========================================================
+def get_spider_vision(mask):
+    y, x = np.where(mask > 0)
+    if len(x) < 30: return 0.0, 0.0, (0, 0), []
+    pts = np.column_stack((x, y)).astype(np.float32)
+    mean, eigenvectors, _ = cv2.PCACompute2(pts, np.mean(pts, axis=0).reshape(1, -1))
+    cx, cy = int(mean[0][0]), int(mean[0][1])
+    maj_angle = np.arctan2(eigenvectors[0,1], eigenvectors[0,0])
+    brd_angle = maj_angle + (np.pi / 2.0)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    web_pts = []
+    if contours:
+        cnt = max(contours, key=cv2.contourArea)
+        web_pts = cnt[::max(1, len(cnt)//10)]
+    return maj_angle, brd_angle, (cx, cy), web_pts
+
+def draw_hud(img, mask, maj, brd, center, web, q_state):
+    # 🎯 Calibration Point
+    cv2.drawMarker(img, (GRIP_X, GRIP_Y), (255, 0, 255), cv2.MARKER_CROSS, 30, 2)
+    
+    if mask is not None:
+        img[mask > 128] = img[mask > 128]*0.4 + np.array([0,255,0],dtype=np.uint8)*0.6
+        cx, cy = center
+        cv2.circle(img, (cx, cy), 6, (0,0,255), -1)
+        for p in web: cv2.line(img, (cx, cy), (int(p[0][0]), int(p[0][1])), (0,0,255), 1)
+
+    # Telemetry Overlay
+    cv2.putText(img, "TELE-OP ACTIVE", (15, 35), 1, 1.5, (0, 255, 255), 2)
+    cv2.putText(img, f"BASE:{q_state[0]:.2f} SHOULDER:{q_state[1]:.2f} ELBOW:{q_state[2]:.2f}", (15, 70), 1, 1, (255, 255, 255), 1)
+    cv2.putText(img, f"GRIPPER: {q_state[4]:.2f}", (15, 100), 1, 1, (0, 255, 0) if q_state[4] > 0.1 else (255, 255, 255), 1)
+    return img
+
+# ==========================================================
+# 2. MAIN TELE-OP LOOP
+# ==========================================================
+model = YOLO(MODEL_SEG_PATH)
+pipeline = rs.pipeline(); config = rs.config()
+config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+align_obj = rs.align(rs.stream.color); pipeline.start(config)
+card = HIL(); card.open("qarm_usb", "0")
+
+print("\n🕹️ TELE-OPERATION MODE ENABLED")
+print("Controls: W/A/S/D (Arm) | Arrows (Elbow/Wrist) | [ ] (Slow Gripper) | Q (Quit)")
+
+try:
+    while True:
+        # 1. Hardware Heartbeat & Write
+        card.write_digital(np.array([0], dtype=np.uint32), 1, np.array([1], dtype=np.uint8))
+        card.write_other(CHANNELS, 5, array('d', curr_q))
+        
+        # 2. Vision Processing
+        f = pipeline.poll_for_frames()
+        mask, ma, br, center, web = None, 0, 0, (0,0), []
+        
+        if f:
+            img = np.asanyarray(f.get_color_frame().get_data())
+            res = model.predict(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), conf=0.45, verbose=False)
+            
+            if res[0].masks is not None and len(res[0].masks.data) > 0:
+                mask_raw = (res[0].masks.data[0].cpu().numpy()*255).astype(np.uint8)
+                ma, br, center, web = get_spider_vision(mask_raw)
+                mask = mask_raw
+            
+            cv2.imshow("Q-Arm Tele-Op", draw_hud(img, mask, ma, br, center, web, curr_q))
+
+        # 3. Input Handling
+        key = cv2.waitKey(1) & 0xFF
+        
+        if key == ord('q'): break
+        
+        # Base Control
+        if key == ord('a'): curr_q[0] += MOVE_STEP
+        if key == ord('d'): curr_q[0] -= MOVE_STEP
+        
+        # Shoulder Control
+        if key == ord('w'): curr_q[1] += MOVE_STEP
+        if key == ord('s'): curr_q[1] -= MOVE_STEP
+        
+        # Elbow Control
+        if key == 82: curr_q[2] -= MOVE_STEP # Up Arrow
+        if key == 84: curr_q[2] += MOVE_STEP # Down Arrow
+        
+        # Wrist Control
+        if key == 81: curr_q[3] -= MOVE_STEP # Left Arrow
+        if key == 83: curr_q[3] += MOVE_STEP # Right Arrow
+        
+        # 🐌 SLOW GRIPPER CONTROL
+        if key == ord('['): # Close
+            curr_q[4] = min(0.9, curr_q[4] + GRIP_STEP)
+        if key == ord(']'): # Open
+            curr_q[4] = max(0.0, curr_q[4] - GRIP_STEP)
+
+        # Safety Limits (Clamping)
+        curr_q[1] = np.clip(curr_q[1], -0.5, 1.2)
+        curr_q[2] = np.clip(curr_q[2], 0.2, 1.5)
+
+finally:
+    # Open gripper and release hardware on exit
+    curr_q[4] = 0.0
+    card.write_other(CHANNELS, 5, array('d', curr_q))
+    card.close(); pipeline.stop(); cv2.destroyAllWindows()
